@@ -45,8 +45,16 @@ std::vector<std::string> scan_audio(const std::string& dir) {
          it != fs::recursive_directory_iterator(); it.increment(ec)) {
         if (ec) { ec.clear(); continue; }
         if (!it->is_regular_file(ec)) continue;
-        std::string p = it->path().string();
-        if (is_audio_file(p)) out.push_back(p);
+        // path::string() on MSVC throws filesystem_error when the native
+        // wide path contains characters not representable in the active
+        // codepage. u8string() is guaranteed to produce UTF-8 without
+        // throwing, which is what TagLib / miniaudio expect on Windows.
+        try {
+            std::string p = it->path().u8string();
+            if (is_audio_file(p)) out.push_back(std::move(p));
+        } catch (...) {
+            // skip unrepresentable paths
+        }
     }
     std::sort(out.begin(), out.end());
     return out;
@@ -58,8 +66,10 @@ std::vector<std::string> find_playlists(const std::string& dir) {
     if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) return out;
     for (auto& e : fs::directory_iterator(dir, ec)) {
         if (!e.is_regular_file()) continue;
-        std::string ext = lower(e.path().extension().string());
-        if (ext == ".m3u" || ext == ".m3u8") out.push_back(e.path().string());
+        try {
+            std::string ext = lower(e.path().extension().u8string());
+            if (ext == ".m3u" || ext == ".m3u8") out.push_back(e.path().u8string());
+        } catch (...) {}
     }
     std::sort(out.begin(), out.end());
     return out;
@@ -81,14 +91,17 @@ std::vector<std::string> parse_m3u(const std::string& m3u_path) {
     while (std::getline(f, line)) {
         std::string s = trim(line);
         if (s.empty() || s[0] == '#') continue;
-        fs::path p(s);
-        if (p.is_relative()) p = base / p;
-        std::error_code ec;
-        fs::path canon = fs::weakly_canonical(p, ec);
-        if (ec) canon = p;
-        if (fs::exists(canon, ec) && is_audio_file(canon.string())) {
-            out.push_back(canon.string());
-        }
+        try {
+            fs::path p = fs::u8path(s);
+            if (p.is_relative()) p = base / p;
+            std::error_code ec;
+            fs::path canon = fs::weakly_canonical(p, ec);
+            if (ec) canon = p;
+            std::string u8 = canon.u8string();
+            if (fs::exists(canon, ec) && is_audio_file(u8)) {
+                out.push_back(std::move(u8));
+            }
+        } catch (...) {}
     }
     return out;
 }
