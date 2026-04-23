@@ -31,10 +31,11 @@ static std::string lower(std::string s) {
 }
 
 bool is_audio_file(const std::string& path) {
+    // We only list formats miniaudio decodes out of the box. .ogg/.opus/.m4a/
+    // .aac previously appeared in the library but miniaudio's default build
+    // can't play them, which made those tracks silently fail in the UI.
     std::string ext = lower(fs::path(path).extension().string());
-    return ext == ".mp3" || ext == ".flac" || ext == ".wav" ||
-           ext == ".ogg" || ext == ".opus" || ext == ".m4a" ||
-           ext == ".aac";
+    return ext == ".mp3" || ext == ".flac" || ext == ".wav";
 }
 
 std::vector<std::string> scan_audio(const std::string& dir) {
