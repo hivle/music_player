@@ -77,6 +77,7 @@ add_executable(music_player
     src/stb_image_impl.cpp
     src/player.cpp
     src/library.cpp
+    src/platform.cpp
     src/theme.cpp
 )
 set_target_properties(music_player PROPERTIES WIN32_EXECUTABLE FALSE)
@@ -93,7 +94,7 @@ else()
 endif()
 
 if(WIN32)
-    target_link_libraries(music_player PRIVATE opengl32)
+    target_link_libraries(music_player PRIVATE opengl32 ole32 shell32 uuid)
     target_compile_definitions(music_player PRIVATE UNICODE _UNICODE)
 else()
     target_link_libraries(music_player PRIVATE pthread dl m)

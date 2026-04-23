@@ -28,20 +28,25 @@
 #include "stb_image.h"
 
 #include "library.h"
+#include "platform.h"
 #include "player.h"
 #include "theme.h"
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <numeric>
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -57,12 +62,9 @@ struct ArtTexture {
     }
 };
 
-static bool upload_art_from_bytes(const std::vector<uint8_t>& bytes, ArtTexture& tex) {
+static bool upload_rgba_to_texture(const unsigned char* pixels, int w, int h, ArtTexture& tex) {
     tex.destroy();
-    if (bytes.empty()) return false;
-    int w, h, n;
-    unsigned char* pixels = stbi_load_from_memory(bytes.data(), (int)bytes.size(), &w, &h, &n, 4);
-    if (!pixels) return false;
+    if (!pixels || w <= 0 || h <= 0) return false;
     glGenTextures(1, &tex.id);
     glBindTexture(GL_TEXTURE_2D, tex.id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -71,10 +73,107 @@ static bool upload_art_from_bytes(const std::vector<uint8_t>& bytes, ArtTexture&
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    stbi_image_free(pixels);
     tex.w = w; tex.h = h;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// ArtLoader: reads cover art + stb_image-decodes it on a worker thread, so
+// clicking a track doesn't stall the UI on big embedded covers. The UI
+// thread polls for results and uploads them to GL (GL calls must stay on
+// the main thread).
+// ---------------------------------------------------------------------------
+class ArtLoader {
+public:
+    struct Result {
+        std::string path;
+        std::vector<unsigned char> pixels;  // RGBA, w*h*4 bytes
+        int w = 0, h = 0;
+        bool empty = true;  // true means "no art for this track"
+    };
+
+    ArtLoader() {
+        worker_ = std::thread([this] { run(); });
+    }
+    ~ArtLoader() {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            quit_ = true;
+        }
+        cv_.notify_one();
+        if (worker_.joinable()) worker_.join();
+    }
+
+    // Queue a decode for `path`. Any prior in-flight result is invalidated.
+    void request(const std::string& path) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ++request_id_;
+        pending_path_ = path;
+        result_ready_ = false;
+        cv_.notify_one();
+    }
+
+    // Cancel any pending / in-flight result.
+    void clear() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        ++request_id_;
+        pending_path_.clear();
+        result_ready_ = false;
+    }
+
+    bool poll(Result& out) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        if (!result_ready_) return false;
+        out = std::move(result_);
+        result_ready_ = false;
+        return true;
+    }
+
+private:
+    void run() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(mtx_);
+            cv_.wait(lk, [&]{ return quit_ || !pending_path_.empty(); });
+            if (quit_) return;
+            std::string path = std::move(pending_path_);
+            pending_path_.clear();
+            uint64_t id = request_id_;
+            lk.unlock();
+
+            Result r;
+            r.path = path;
+            AlbumArt art = library::read_cover_art(path);
+            if (art.valid()) {
+                int w, h, n;
+                unsigned char* px = stbi_load_from_memory(
+                    art.data.data(), (int)art.data.size(), &w, &h, &n, 4);
+                if (px) {
+                    r.pixels.assign(px, px + (size_t)w * h * 4);
+                    r.w = w; r.h = h; r.empty = false;
+                    stbi_image_free(px);
+                }
+            }
+
+            lk.lock();
+            // Drop if a newer request came in while we were decoding.
+            if (id == request_id_) {
+                result_ = std::move(r);
+                result_ready_ = true;
+            }
+        }
+    }
+
+    std::thread worker_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    bool quit_ = false;
+
+    std::string pending_path_;
+    uint64_t request_id_ = 0;
+
+    bool result_ready_ = false;
+    Result result_;
+};
 
 // ---------------------------------------------------------------------------
 // Async library loader: fills metadata on a background thread so the UI
@@ -119,6 +218,20 @@ public:
     const std::vector<Track>& tracks() const { return tracks_; }
     size_t loaded() const { return loaded_count_.load(); }
     size_t total() const { return total_; }
+
+    // Move tracks_[from] to the slot currently occupied by tracks_[to].
+    // Returns the new index of the moved item, or -1 on bad input.
+    int move_track(int from, int to) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        int n = (int)tracks_.size();
+        if (from < 0 || from >= n || to < 0 || to >= n || from == to) return -1;
+        Track moving = std::move(tracks_[from]);
+        tracks_.erase(tracks_.begin() + from);
+        int dst = (from < to) ? to - 1 : to;
+        if (dst > (int)tracks_.size()) dst = (int)tracks_.size();
+        tracks_.insert(tracks_.begin() + dst, std::move(moving));
+        return dst;
+    }
 
 private:
     void cancel_and_join() {
@@ -204,6 +317,35 @@ int main(int argc, char** argv) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
+
+    // Load a Unicode-capable system font so tags/filenames in non-Latin
+    // scripts (CJK, Cyrillic, Greek, Vietnamese, Thai, ...) render as real
+    // glyphs instead of "?" boxes. The default ImGui font is ASCII-only.
+    {
+        static ImVector<ImWchar> ranges;
+        ImFontGlyphRangesBuilder b;
+        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+        b.AddRanges(io.Fonts->GetGlyphRangesGreek());
+        b.AddRanges(io.Fonts->GetGlyphRangesVietnamese());
+        b.AddRanges(io.Fonts->GetGlyphRangesThai());
+        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        b.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
+        b.AddRanges(io.Fonts->GetGlyphRangesKorean());
+        b.BuildRanges(&ranges);
+
+        ImFont* loaded = nullptr;
+        for (const auto& path : platform::find_ui_fonts()) {
+            ImFontConfig cfg;
+            cfg.OversampleH = 1;
+            cfg.OversampleV = 1;
+            cfg.PixelSnapH = true;
+            loaded = io.Fonts->AddFontFromFileTTF(path.c_str(), 15.0f, &cfg, ranges.Data);
+            if (loaded) break;
+        }
+        if (!loaded) io.Fonts->AddFontDefault();
+    }
+
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 120");
     theme::apply_style();
@@ -220,8 +362,15 @@ int main(int argc, char** argv) {
 
     LibraryLoader loader;
     Player player;
+    ArtLoader art_loader;
     int current_track = -1;
     ArtTexture art;
+    std::string art_path; // path the current `art` texture belongs to
+
+    // Tracks whose miniaudio load failed. We auto-skip them when advancing
+    // through the list and show a "Unplayable" marker in the UI.
+    std::unordered_set<std::string> unplayable;
+    std::string last_error; // shown in status line
 
     ShuffleMode shuffle_mode = ShuffleMode::Off;
     std::vector<int> shuffle_order;
@@ -276,21 +425,44 @@ int main(int argc, char** argv) {
     rebuild_track_list();
 
     auto play_index = [&](int idx) {
-        std::lock_guard<std::mutex> lk(loader.mutex());
-        const auto& tracks = loader.tracks();
-        if (idx < 0 || idx >= (int)tracks.size()) return;
+        std::string path;
+        int n = 0;
+        {
+            std::lock_guard<std::mutex> lk(loader.mutex());
+            const auto& tracks = loader.tracks();
+            n = (int)tracks.size();
+            if (idx < 0 || idx >= n) return;
+            path = tracks[idx].path;
+        }
         current_track = idx;
-        if (!player.load(tracks[idx].path)) return;
+        if (!player.load(path)) {
+            unplayable.insert(path);
+            last_error = "Could not play: " + fs::path(path).filename().string();
+            return;
+        }
+        unplayable.erase(path);
+        last_error.clear();
         player.play();
-        push_history(tracks[idx].path);
-        auto a = library::read_cover_art(tracks[idx].path);
-        if (a.valid()) upload_art_from_bytes(a.data, art);
-        else art.destroy();
+        push_history(path);
+        // Clear any previous cover immediately so the old track's art doesn't
+        // briefly show for the new track while the decoder is still running.
+        if (art_path != path) { art.destroy(); art_path.clear(); }
+        // Decode cover art off the UI thread so switching tracks feels
+        // instant even for files with large embedded covers.
+        art_loader.request(path);
         if (shuffle_mode != ShuffleMode::Off) {
             auto it = std::find(shuffle_order.begin(), shuffle_order.end(), idx);
             if (it != shuffle_order.end())
                 shuffle_pos = (int)std::distance(shuffle_order.begin(), it);
         }
+    };
+
+    // Look at tracks[i].path without long-lived locking.
+    auto path_at = [&](int i) -> std::string {
+        std::lock_guard<std::mutex> lk(loader.mutex());
+        const auto& tracks = loader.tracks();
+        if (i < 0 || i >= (int)tracks.size()) return "";
+        return tracks[i].path;
     };
 
     auto next_track = [&]() {
@@ -301,43 +473,91 @@ int main(int argc, char** argv) {
         }
         if (n == 0) return;
         if (shuffle_mode == ShuffleMode::Off) {
-            int next = std::min(n - 1, current_track + 1);
-            if (next != current_track) play_index(next);
+            // Scan forward for the next playable track.
+            for (int i = current_track + 1; i < n; ++i) {
+                if (unplayable.count(path_at(i))) continue;
+                play_index(i);
+                return;
+            }
         } else {
             if (shuffle_order.empty() || (int)shuffle_order.size() != n) rebuild_shuffle_for_current();
-            shuffle_pos = (shuffle_pos + 1) % (int)shuffle_order.size();
-            if (shuffle_pos == 0) {
-                // completed a cycle: reshuffle for next round (iPod classic behaviour)
-                std::lock_guard<std::mutex> lk(loader.mutex());
-                build_shuffle_order(loader.tracks(), shuffle_mode, shuffle_order);
+            int tried = 0;
+            while (tried < (int)shuffle_order.size()) {
+                shuffle_pos = (shuffle_pos + 1) % (int)shuffle_order.size();
+                if (shuffle_pos == 0) {
+                    std::lock_guard<std::mutex> lk(loader.mutex());
+                    build_shuffle_order(loader.tracks(), shuffle_mode, shuffle_order);
+                }
+                int idx = shuffle_order[shuffle_pos];
+                if (!unplayable.count(path_at(idx))) { play_index(idx); return; }
+                ++tried;
             }
-            play_index(shuffle_order[shuffle_pos]);
         }
     };
 
     auto prev_track = [&]() {
         if (shuffle_mode == ShuffleMode::Off) {
-            if (current_track > 0) play_index(current_track - 1);
+            for (int i = current_track - 1; i >= 0; --i) {
+                if (unplayable.count(path_at(i))) continue;
+                play_index(i);
+                return;
+            }
         } else if (!shuffle_order.empty()) {
-            shuffle_pos = (shuffle_pos - 1 + (int)shuffle_order.size()) % (int)shuffle_order.size();
-            play_index(shuffle_order[shuffle_pos]);
+            int tried = 0;
+            while (tried < (int)shuffle_order.size()) {
+                shuffle_pos = (shuffle_pos - 1 + (int)shuffle_order.size()) % (int)shuffle_order.size();
+                int idx = shuffle_order[shuffle_pos];
+                if (!unplayable.count(path_at(idx))) { play_index(idx); return; }
+                ++tried;
+            }
         }
     };
 
-    // Window drag state for borderless titlebar.
+    // Window drag state for borderless titlebar. We track where the cursor
+    // sat *inside the window* at drag-start, and each frame compute a new
+    // window position that keeps that offset constant. Using the drag-start
+    // window position here instead would feed back on itself (GLFW reports
+    // cursor positions relative to the window, which itself just moved) and
+    // cause 1-2 px jitter on every frame.
     bool dragging = false;
-    double drag_cursor_x = 0, drag_cursor_y = 0;
-    int drag_win_x = 0, drag_win_y = 0;
+    double drag_offset_x = 0, drag_offset_y = 0;
 
     // Deferred actions (set during render, processed after so we don't re-lock
     // loader.mutex() in the middle of a render that already holds it).
     int pending_play = -1;
     bool pending_play_current = false;
+    int pending_reorder_from = -1;
+    int pending_reorder_to = -1;
+    bool open_save_playlist_popup = false;
+    char save_playlist_buf[256] = "queue.m3u";
 
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
 
         if (player.reached_end()) next_track();
+
+        // Upload any art that finished decoding on the worker thread. We
+        // only replace the current texture if the decoded path still matches
+        // what the user is playing — otherwise a stale decode would briefly
+        // flash the wrong cover.
+        {
+            ArtLoader::Result r;
+            while (art_loader.poll(r)) {
+                std::string cur;
+                {
+                    std::lock_guard<std::mutex> lk(loader.mutex());
+                    const auto& tracks = loader.tracks();
+                    if (current_track >= 0 && current_track < (int)tracks.size())
+                        cur = tracks[current_track].path;
+                }
+                if (r.path != cur) continue;
+                if (r.empty) { art.destroy(); art_path.clear(); }
+                else {
+                    upload_rgba_to_texture(r.pixels.data(), r.w, r.h, art);
+                    art_path = r.path;
+                }
+            }
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
@@ -418,15 +638,16 @@ int main(int argc, char** argv) {
         else if (mouse_clicked && min_hover)     glfwIconifyWindow(window);
         else if (mouse_clicked && on_titlebar && !close_hover && !min_hover) {
             dragging = true;
-            glfwGetCursorPos(window, &drag_cursor_x, &drag_cursor_y);
-            glfwGetWindowPos(window, &drag_win_x, &drag_win_y);
+            glfwGetCursorPos(window, &drag_offset_x, &drag_offset_y);
         }
         if (dragging && mouse_down) {
             double cx, cy;
             glfwGetCursorPos(window, &cx, &cy);
+            int wx, wy;
+            glfwGetWindowPos(window, &wx, &wy);
             glfwSetWindowPos(window,
-                             drag_win_x + (int)(cx - drag_cursor_x),
-                             drag_win_y + (int)(cy - drag_cursor_y));
+                             wx + (int)(cx - drag_offset_x),
+                             wy + (int)(cy - drag_offset_y));
         }
         if (mouse_released) dragging = false;
 
@@ -438,7 +659,7 @@ int main(int argc, char** argv) {
         // Top row: folder + load
         ImGui::Text("Folder");
         ImGui::SameLine();
-        ImGui::PushItemWidth(-200);
+        ImGui::PushItemWidth(-420);
         if (ImGui::InputText("##folder", folder_buf, sizeof(folder_buf),
                              ImGuiInputTextFlags_EnterReturnsTrue)) {
             folder = folder_buf;
@@ -447,10 +668,25 @@ int main(int argc, char** argv) {
         }
         ImGui::PopItemWidth();
         ImGui::SameLine();
-        if (theme::xp_button("Load", ImVec2(80, 24))) {
+        if (theme::xp_button("Browse...", ImVec2(90, 24))) {
+            std::string picked = platform::pick_folder(folder);
+            if (!picked.empty()) {
+                folder = picked;
+                std::strncpy(folder_buf, folder.c_str(), sizeof(folder_buf) - 1);
+                folder_buf[sizeof(folder_buf) - 1] = '\0';
+                reload_library();
+                rebuild_track_list();
+            }
+        }
+        ImGui::SameLine();
+        if (theme::xp_button("Load", ImVec2(70, 24))) {
             folder = folder_buf;
             reload_library();
             rebuild_track_list();
+        }
+        ImGui::SameLine();
+        if (theme::xp_button("Save Playlist", ImVec2(120, 24))) {
+            open_save_playlist_popup = true;
         }
         ImGui::SameLine();
         ImGui::Text("%zu/%zu", loader.loaded(), loader.total());
@@ -492,21 +728,28 @@ int main(int argc, char** argv) {
 
         ImGui::Dummy(ImVec2(0, 2));
 
-        // Middle: track list on left, art + metadata on right
-        const float right_w = 260.f;
-        float body_h = ImGui::GetContentRegionAvail().y - 100.f;
-        if (body_h < 120) body_h = 120;
+        // Bottom pane: fixed-height row with album art + metadata on the left,
+        // progress bar and transport controls stacked on the right. Everything
+        // above it is the playlist.
+        const float ART_SIZE    = 104.f;
+        const float BOTTOM_H    = ART_SIZE + 16.f; // art + a little padding
+        const float PROG_H      = 22.f;
+        const float TRANS_H     = 34.f;
+        const float SPACING     = 4.f;
+        const float FOOTER_H    = BOTTOM_H + PROG_H + TRANS_H + SPACING * 3.f;
 
-        // Track list
+        // --- Playlist (top, full width) ---------------------------------
+        float list_h = ImGui::GetContentRegionAvail().y - FOOTER_H;
+        if (list_h < 120) list_h = 120;
         {
+            float list_w = ImGui::GetContentRegionAvail().x;
             ImVec2 panel_min = ImGui::GetCursorScreenPos();
-            float list_w = ImGui::GetContentRegionAvail().x - right_w - 8;
-            ImVec2 panel_max(panel_min.x + list_w, panel_min.y + body_h);
+            ImVec2 panel_max(panel_min.x + list_w, panel_min.y + list_h);
             theme::draw_sunken_panel(dl, panel_min, panel_max, IM_COL32(255, 255, 255, 255));
 
             ImGui::PushStyleColor(ImGuiCol_ChildBg, IM_COL32(255, 255, 255, 255));
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6, 6));
-            ImGui::BeginChild("##tracks", ImVec2(list_w, body_h), false);
+            ImGui::BeginChild("##tracks", ImVec2(list_w, list_h), false);
 
             std::lock_guard<std::mutex> lk(loader.mutex());
             const auto& tracks = loader.tracks();
@@ -514,23 +757,56 @@ int main(int argc, char** argv) {
             if (tracks.empty()) {
                 ImGui::TextDisabled("No tracks.");
             } else {
-                ImGuiListClipper clipper;
-                clipper.Begin((int)tracks.size());
-                while (clipper.Step()) {
-                    for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-                        const auto& t = tracks[i];
-                        std::string label = t.artist.empty()
-                            ? t.title
-                            : (t.artist + " - " + t.title);
-                        char line[512];
-                        std::snprintf(line, sizeof(line), "%4d. %s", i + 1, label.c_str());
-                        bool sel = (i == current_track);
-                        ImGui::PushID(i);
-                        if (ImGui::Selectable(line, sel, ImGuiSelectableFlags_AllowDoubleClick)) {
-                            if (ImGui::IsMouseDoubleClicked(0)) pending_play = i;
-                            else current_track = i;
+                // Clipper + drag-and-drop don't mix well because the payload
+                // source/target rows must exist during the same frame. Only
+                // use the clipper when no drag is in progress.
+                bool dragging_payload = ImGui::GetDragDropPayload() != nullptr;
+                auto render_row = [&](int i) {
+                    const auto& t = tracks[i];
+                    std::string label = t.artist.empty()
+                        ? t.title
+                        : (t.artist + " - " + t.title);
+                    bool bad = unplayable.count(t.path) > 0;
+                    char line[512];
+                    std::snprintf(line, sizeof(line), "%4d. %s%s",
+                                  i + 1, label.c_str(),
+                                  bad ? "   [Unplayable]" : "");
+                    bool sel = (i == current_track);
+                    ImGui::PushID(i);
+                    if (bad) ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(170, 50, 50, 255));
+                    if (ImGui::Selectable(line, sel, ImGuiSelectableFlags_AllowDoubleClick)) {
+                        if (ImGui::IsMouseDoubleClicked(0)) pending_play = i;
+                        else current_track = i;
+                    }
+                    if (bad) ImGui::PopStyleColor();
+
+                    // Drag source: picks the row up.
+                    if (ImGui::BeginDragDropSource(ImGuiDragDropFlags_SourceAllowNullID)) {
+                        ImGui::SetDragDropPayload("TRACK_ROW", &i, sizeof(int));
+                        ImGui::Text("Move: %s", label.c_str());
+                        ImGui::EndDragDropSource();
+                    }
+                    // Drop target: places the dragged row before this one.
+                    if (ImGui::BeginDragDropTarget()) {
+                        if (const ImGuiPayload* p = ImGui::AcceptDragDropPayload("TRACK_ROW")) {
+                            int from = *(const int*)p->Data;
+                            pending_reorder_from = from;
+                            pending_reorder_to = i;
                         }
-                        ImGui::PopID();
+                        ImGui::EndDragDropTarget();
+                    }
+                    ImGui::PopID();
+                };
+
+                if (dragging_payload) {
+                    for (int i = 0; i < (int)tracks.size(); ++i) render_row(i);
+                } else {
+                    ImGuiListClipper clipper;
+                    clipper.Begin((int)tracks.size());
+                    while (clipper.Step()) {
+                        for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                            render_row(i);
+                        }
                     }
                 }
             }
@@ -539,32 +815,34 @@ int main(int argc, char** argv) {
             ImGui::PopStyleColor();
         }
 
-        // Right: album art + metadata
-        ImGui::SameLine();
-        ImGui::BeginGroup();
+        // --- Bottom row: album art + metadata ---------------------------
+        ImGui::Dummy(ImVec2(0, SPACING));
         {
             ImVec2 art_min = ImGui::GetCursorScreenPos();
-            float art_size = right_w - 20.f;
-            ImVec2 art_max(art_min.x + art_size, art_min.y + art_size);
+            ImVec2 art_max(art_min.x + ART_SIZE, art_min.y + ART_SIZE);
             theme::draw_sunken_panel(dl, art_min, art_max, IM_COL32(255, 255, 255, 255));
             if (art.id) {
                 dl->AddImage((ImTextureID)(intptr_t)art.id,
                              ImVec2(art_min.x + 3, art_min.y + 3),
                              ImVec2(art_max.x - 3, art_max.y - 3));
             } else {
-                ImVec2 ts = ImGui::CalcTextSize("(no album art)");
-                dl->AddText(ImVec2(art_min.x + (art_size - ts.x) * 0.5f,
-                                   art_min.y + (art_size - ts.y) * 0.5f),
-                            IM_COL32(150, 150, 150, 255), "(no album art)");
+                ImVec2 ts = ImGui::CalcTextSize("(no art)");
+                dl->AddText(ImVec2(art_min.x + (ART_SIZE - ts.x) * 0.5f,
+                                   art_min.y + (ART_SIZE - ts.y) * 0.5f),
+                            IM_COL32(150, 150, 150, 255), "(no art)");
             }
-            ImGui::Dummy(ImVec2(art_size, art_size));
-            ImGui::Spacing();
+            ImGui::Dummy(ImVec2(ART_SIZE, ART_SIZE));
+
+            ImGui::SameLine();
+            ImGui::BeginGroup();
+            ImGui::Dummy(ImVec2(0, 2));
             {
                 std::lock_guard<std::mutex> lk(loader.mutex());
                 const auto& tracks = loader.tracks();
                 if (current_track >= 0 && current_track < (int)tracks.size()) {
                     const auto& t = tracks[current_track];
-                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + art_size);
+                    float wrap_w = ImGui::GetContentRegionAvail().x - 8.f;
+                    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + wrap_w);
                     ImGui::TextColored(ImVec4(0, 0, 0, 1), "%s", t.title.c_str());
                     if (!t.artist.empty())
                         ImGui::TextColored(ImVec4(0.20f, 0.30f, 0.55f, 1), "%s", t.artist.c_str());
@@ -575,11 +853,11 @@ int main(int argc, char** argv) {
                     ImGui::TextDisabled("Nothing playing");
                 }
             }
+            ImGui::EndGroup();
         }
-        ImGui::EndGroup();
 
-        // Seek bar
-        ImGui::Dummy(ImVec2(0, 4));
+        // --- Progress / seek bar ---------------------------------------
+        ImGui::Dummy(ImVec2(0, SPACING));
         double pos = player.position_seconds();
         double dur = player.duration_seconds();
         if (dur <= 0.0 && current_track >= 0) {
@@ -599,36 +877,142 @@ int main(int argc, char** argv) {
         ImGui::SameLine();
         ImGui::Text("%s", format_time(dur).c_str());
 
-        // Transport
-        ImGui::Dummy(ImVec2(0, 4));
-        ImVec2 btn(64, 28);
+        // --- Transport + fast skip + volume ----------------------------
+        // Fast skip jumps by FAST_SKIP_SECONDS within the current track.
+        // Keyboard shortcuts: Left / Right arrows, Space toggles play.
+        constexpr double FAST_SKIP_SECONDS = 10.0;
+        auto fast_skip = [&](double delta) {
+            if (!player.is_loaded()) return;
+            double d = player.duration_seconds();
+            double np = player.position_seconds() + delta;
+            if (np < 0) np = 0;
+            if (d > 0 && np > d - 0.25) np = std::max(0.0, d - 0.25);
+            player.seek_seconds(np);
+        };
+
+        ImGui::Dummy(ImVec2(0, SPACING));
+        ImVec2 btn(52, 28);
         if (theme::xp_button("|<<", btn)) prev_track();
         ImGui::SameLine();
+        if (theme::xp_button("<< 10s", ImVec2(68, 28))) fast_skip(-FAST_SKIP_SECONDS);
+        ImGui::SameLine();
         const char* play_label = player.is_playing() ? "|| Pause" : "> Play";
-        if (theme::xp_green_button(play_label, ImVec2(110, 28))) {
+        if (theme::xp_green_button(play_label, ImVec2(100, 28))) {
             if (!player.is_loaded()) pending_play_current = true;
             else player.toggle();
         }
         ImGui::SameLine();
+        if (theme::xp_button("10s >>", ImVec2(68, 28))) fast_skip(FAST_SKIP_SECONDS);
+        ImGui::SameLine();
         if (theme::xp_button(">>|", btn)) next_track();
         ImGui::SameLine();
-        if (theme::xp_button("[ ] Stop", ImVec2(84, 28))) player.stop();
+        if (theme::xp_button("[ ] Stop", ImVec2(76, 28))) player.stop();
 
         ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16, 0));
+        ImGui::Dummy(ImVec2(12, 0));
         ImGui::SameLine();
         ImGui::Text("Vol");
         ImGui::SameLine();
         float vol = player.volume();
-        ImGui::PushItemWidth(120);
+        ImGui::PushItemWidth(100);
         if (ImGui::SliderFloat("##vol", &vol, 0.f, 1.f, "")) player.set_volume(vol);
         ImGui::PopItemWidth();
+
+        // Keyboard shortcuts — only when no text field has focus, so typing
+        // in the Folder input doesn't trigger seeks.
+        if (!ImGui::IsAnyItemActive()) {
+            if (ImGui::IsKeyPressed(ImGuiKey_RightArrow, true)) fast_skip(FAST_SKIP_SECONDS);
+            if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow, true))  fast_skip(-FAST_SKIP_SECONDS);
+            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                if (!player.is_loaded()) pending_play_current = true;
+                else player.toggle();
+            }
+        }
+
+        // Status line under controls.
+        if (!last_error.empty()) {
+            ImGui::TextColored(ImVec4(0.65f, 0.10f, 0.10f, 1.f), "%s", last_error.c_str());
+        }
+
+        // Save-playlist popup.
+        if (open_save_playlist_popup) {
+            ImGui::OpenPopup("Save Playlist");
+            open_save_playlist_popup = false;
+        }
+        ImGui::SetNextWindowSize(ImVec2(360, 0), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Save Playlist", nullptr,
+                                    ImGuiWindowFlags_NoResize)) {
+            ImGui::Text("Save current queue to an .m3u file in:");
+            ImGui::TextWrapped("%s", folder.c_str());
+            ImGui::Dummy(ImVec2(0, 4));
+            ImGui::SetNextItemWidth(-1);
+            ImGui::InputText("##name", save_playlist_buf, sizeof(save_playlist_buf));
+            ImGui::Dummy(ImVec2(0, 4));
+            bool do_save = false;
+            if (theme::xp_button("Save", ImVec2(90, 26))) do_save = true;
+            ImGui::SameLine();
+            if (theme::xp_button("Cancel", ImVec2(90, 26))) ImGui::CloseCurrentPopup();
+            if (do_save) {
+                std::string name = save_playlist_buf;
+                if (!name.empty()) {
+                    // Force a .m3u extension if missing.
+                    std::string lower_name;
+                    lower_name.reserve(name.size());
+                    for (char c : name) lower_name.push_back((char)std::tolower((unsigned char)c));
+                    if (lower_name.find(".m3u") == std::string::npos &&
+                        lower_name.find(".m3u8") == std::string::npos) {
+                        name += ".m3u";
+                    }
+                    fs::path out_path = fs::path(folder) / fs::u8path(name);
+                    std::ofstream out(out_path, std::ios::binary);
+                    if (out) {
+                        out << "#EXTM3U\n";
+                        std::lock_guard<std::mutex> lk(loader.mutex());
+                        for (const auto& t : loader.tracks()) {
+                            int secs = (int)t.duration_seconds;
+                            std::string disp = t.artist.empty()
+                                ? t.title
+                                : (t.artist + " - " + t.title);
+                            out << "#EXTINF:" << secs << "," << disp << "\n";
+                            out << t.path << "\n";
+                        }
+                    }
+                    // Refresh source list so the new playlist appears.
+                    playlists = library::find_playlists(folder);
+                }
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
 
         ImGui::EndChild();
         ImGui::PopStyleVar();
         ImGui::End();
 
         // Process deferred actions (outside of any held loader mutex).
+        if (pending_reorder_from >= 0 && pending_reorder_to >= 0) {
+            // Record which track was playing so we can follow it through
+            // the reorder. Anchor by path: indices shift as items move.
+            std::string playing_path;
+            {
+                std::lock_guard<std::mutex> lk(loader.mutex());
+                const auto& tracks = loader.tracks();
+                if (current_track >= 0 && current_track < (int)tracks.size())
+                    playing_path = tracks[current_track].path;
+            }
+            int moved = loader.move_track(pending_reorder_from, pending_reorder_to);
+            (void)moved;
+            if (!playing_path.empty()) {
+                std::lock_guard<std::mutex> lk(loader.mutex());
+                const auto& tracks = loader.tracks();
+                for (int i = 0; i < (int)tracks.size(); ++i) {
+                    if (tracks[i].path == playing_path) { current_track = i; break; }
+                }
+            }
+            // Rebuild shuffle order to reflect the new track list.
+            rebuild_shuffle_for_current();
+            pending_reorder_from = pending_reorder_to = -1;
+        }
         if (pending_play >= 0) {
             play_index(pending_play);
             pending_play = -1;
