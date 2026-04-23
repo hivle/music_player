@@ -16,6 +16,11 @@
     #include <GL/gl.h>
 #endif
 
+// Windows's <GL/gl.h> is frozen at GL 1.1 and omits some 1.2+ constants.
+#ifndef GL_CLAMP_TO_EDGE
+#define GL_CLAMP_TO_EDGE 0x812F
+#endif
+
 #include "imgui.h"
 #include "backends/imgui_impl_glfw.h"
 #include "backends/imgui_impl_opengl3.h"
