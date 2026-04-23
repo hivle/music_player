@@ -91,15 +91,30 @@ std::vector<std::string> find_ui_fonts() {
     const char* win = std::getenv("WINDIR");
     std::string root = (win && *win) ? std::string(win) + "\\Fonts\\" : std::string("C:\\Windows\\Fonts\\");
     const char* candidates[] = {
-        "seguiemj.ttf",  // Segoe UI Emoji — not great for text but broad
-        "msyh.ttc",      // Microsoft YaHei (Simplified Chinese)
+        "segoeui.ttf",   // Segoe UI (Latin/Cyrillic/Greek)
+        "arial.ttf",
+        "tahoma.ttf",
+    };
+    for (const char* c : candidates) {
+        std::string p = root + c;
+        std::error_code ec;
+        if (fs::exists(p, ec)) out.push_back(p);
+    }
+    return out;
+}
+
+std::vector<std::string> find_cjk_fonts() {
+    std::vector<std::string> out;
+    const char* win = std::getenv("WINDIR");
+    std::string root = (win && *win) ? std::string(win) + "\\Fonts\\" : std::string("C:\\Windows\\Fonts\\");
+    const char* candidates[] = {
+        "msyh.ttc",      // Microsoft YaHei (Simplified Chinese, has JP kana)
         "msyh.ttf",
         "YuGothM.ttc",   // Yu Gothic Medium (Japanese)
         "meiryo.ttc",    // Meiryo (Japanese)
         "malgun.ttf",    // Malgun Gothic (Korean)
         "simsun.ttc",    // SimSun (Simplified Chinese)
-        "segoeui.ttf",   // Segoe UI (Latin/Cyrillic/Greek/Arabic/Hebrew)
-        "arial.ttf",
+        "mingliu.ttc",   // MingLiU (Traditional Chinese)
     };
     for (const char* c : candidates) {
         std::string p = root + c;
@@ -130,11 +145,24 @@ std::string pick_folder(const std::string& /*initial_dir*/) {
 std::vector<std::string> find_ui_fonts() {
     std::vector<std::string> out;
     const char* candidates[] = {
+        "/System/Library/Fonts/Helvetica.ttc",
+        "/System/Library/Fonts/HelveticaNeue.ttc",
+        "/Library/Fonts/Arial.ttf",
+    };
+    for (const char* c : candidates) {
+        std::error_code ec;
+        if (fs::exists(c, ec)) out.push_back(c);
+    }
+    return out;
+}
+
+std::vector<std::string> find_cjk_fonts() {
+    std::vector<std::string> out;
+    const char* candidates[] = {
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/AppleSDGothicNeo.ttc",
-        "/System/Library/Fonts/Helvetica.ttc",
         "/Library/Fonts/Arial Unicode.ttf",
     };
     for (const char* c : candidates) {
@@ -196,16 +224,6 @@ std::string pick_folder(const std::string& initial_dir) {
 std::vector<std::string> find_ui_fonts() {
     std::vector<std::string> out;
     const char* candidates[] = {
-        // Broad-coverage CJK fonts first so Asian tags render.
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
-        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        // Latin + Cyrillic + Greek fallbacks.
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
@@ -213,6 +231,37 @@ std::vector<std::string> find_ui_fonts() {
         "/usr/share/fonts/liberation-sans/LiberationSans-Regular.ttf",
         "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
         "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    };
+    for (const char* c : candidates) {
+        std::error_code ec;
+        if (fs::exists(c, ec)) out.push_back(c);
+    }
+    return out;
+}
+
+std::vector<std::string> find_cjk_fonts() {
+    std::vector<std::string> out;
+    const char* candidates[] = {
+        // Noto CJK — single file covers Chinese + Japanese + Korean.
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        // WenQuanYi — Chinese-first but includes kana + Hangul syllables.
+        "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+        "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        // IPA Gothic — Japanese-first (kana + common kanji).
+        "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/ipa-gothic/ipag.ttf",
+        // Nanum — Korean-first.
+        "/usr/share/fonts/nanum/NanumGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        // Unifont — last resort, covers everything at bitmap quality.
+        "/usr/share/fonts/opentype/unifont/unifont.otf",
+        "/usr/share/fonts/X11/misc/unifont.otf",
     };
     for (const char* c : candidates) {
         std::error_code ec;

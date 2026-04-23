@@ -318,32 +318,81 @@ int main(int argc, char** argv) {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
 
-    // Load a Unicode-capable system font so tags/filenames in non-Latin
-    // scripts (CJK, Cyrillic, Greek, Vietnamese, Thai, ...) render as real
-    // glyphs instead of "?" boxes. The default ImGui font is ASCII-only.
+    // Load a Unicode-capable system font setup so tags/filenames in non-Latin
+    // scripts render as real glyphs instead of "?" boxes. We do this in two
+    // passes: a Latin-friendly primary font first, then a CJK font merged on
+    // top of the same ImFont — that way Chinese / Japanese / Korean glyphs
+    // fall through to a font that actually contains them, without dropping
+    // the nicer Latin rendering.
+    //
+    // Hint a generous atlas width so 20k+ CJK glyphs don't get silently
+    // clipped on GPUs that default to a small texture limit.
+    io.Fonts->TexDesiredWidth = 4096;
+    const float FONT_PX = 15.0f;
     {
-        static ImVector<ImWchar> ranges;
-        ImFontGlyphRangesBuilder b;
-        b.AddRanges(io.Fonts->GetGlyphRangesDefault());
-        b.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
-        b.AddRanges(io.Fonts->GetGlyphRangesGreek());
-        b.AddRanges(io.Fonts->GetGlyphRangesVietnamese());
-        b.AddRanges(io.Fonts->GetGlyphRangesThai());
-        b.AddRanges(io.Fonts->GetGlyphRangesJapanese());
-        b.AddRanges(io.Fonts->GetGlyphRangesChineseSimplifiedCommon());
-        b.AddRanges(io.Fonts->GetGlyphRangesKorean());
-        b.BuildRanges(&ranges);
+        // Primary ranges: everything that fits comfortably in a non-CJK font.
+        static ImVector<ImWchar> latin_ranges;
+        ImFontGlyphRangesBuilder lb;
+        lb.AddRanges(io.Fonts->GetGlyphRangesDefault());
+        lb.AddRanges(io.Fonts->GetGlyphRangesCyrillic());
+        lb.AddRanges(io.Fonts->GetGlyphRangesGreek());
+        lb.AddRanges(io.Fonts->GetGlyphRangesVietnamese());
+        lb.AddRanges(io.Fonts->GetGlyphRangesThai());
+        lb.BuildRanges(&latin_ranges);
 
-        ImFont* loaded = nullptr;
+        ImFont* primary = nullptr;
         for (const auto& path : platform::find_ui_fonts()) {
             ImFontConfig cfg;
             cfg.OversampleH = 1;
             cfg.OversampleV = 1;
             cfg.PixelSnapH = true;
-            loaded = io.Fonts->AddFontFromFileTTF(path.c_str(), 15.0f, &cfg, ranges.Data);
-            if (loaded) break;
+            primary = io.Fonts->AddFontFromFileTTF(path.c_str(), FONT_PX, &cfg, latin_ranges.Data);
+            if (primary) {
+                std::fprintf(stderr, "[fonts] primary: %s\n", path.c_str());
+                break;
+            }
         }
-        if (!loaded) io.Fonts->AddFontDefault();
+        if (!primary) {
+            std::fprintf(stderr, "[fonts] primary: (fallback to ImGui default)\n");
+            io.Fonts->AddFontDefault();
+        }
+
+        // CJK merged on top of the primary. Include explicit kana +
+        // full-width punctuation ranges in case the ImGui helper misses any.
+        static ImVector<ImWchar> cjk_ranges;
+        ImFontGlyphRangesBuilder cb;
+        cb.AddRanges(io.Fonts->GetGlyphRangesJapanese());
+        cb.AddRanges(io.Fonts->GetGlyphRangesChineseFull());
+        cb.AddRanges(io.Fonts->GetGlyphRangesKorean());
+        static const ImWchar extra_cjk[] = {
+            0x3000, 0x303F,   // CJK Symbols and Punctuation
+            0x3040, 0x309F,   // Hiragana
+            0x30A0, 0x30FF,   // Katakana
+            0x31F0, 0x31FF,   // Katakana Phonetic Extensions
+            0xFF00, 0xFFEF,   // Halfwidth and Fullwidth Forms
+            0,
+        };
+        cb.AddRanges(extra_cjk);
+        cb.BuildRanges(&cjk_ranges);
+
+        ImFont* cjk = nullptr;
+        for (const auto& path : platform::find_cjk_fonts()) {
+            ImFontConfig cfg;
+            cfg.OversampleH = 1;
+            cfg.OversampleV = 1;
+            cfg.PixelSnapH = true;
+            cfg.MergeMode = true; // merges into whichever primary was added above
+            cjk = io.Fonts->AddFontFromFileTTF(path.c_str(), FONT_PX, &cfg, cjk_ranges.Data);
+            if (cjk) {
+                std::fprintf(stderr, "[fonts] CJK: %s\n", path.c_str());
+                break;
+            }
+        }
+        if (!cjk) {
+            std::fprintf(stderr, "[fonts] CJK: NONE FOUND "
+                                 "(install fonts-noto-cjk or fonts-wqy-zenhei "
+                                 "or fonts-ipafont-gothic to see Chinese/Japanese/Korean)\n");
+        }
     }
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);
